@@ -1,0 +1,248 @@
+const moegoClient = require('../services/moegoClient');
+const hubspotClient = require('../services/hubspotClient');
+const { mapCustomerToContact } = require('../mappers/contactMapper');
+const { mapPetToCompany } = require('../mappers/petMapper');
+const { mapAppointmentToDeal } = require('../mappers/appointmentMapper');
+const { getSyncCursor, setSyncCursor, logSyncRun } = require('../storage/stateStore');
+const logger = require('../utils/logger');
+
+/**
+ * Syncs a full customer tree (Contact -> Pets -> Appointments -> Dual Associations)
+ */
+async function syncCustomerBundle(customerId) {
+  logger.info(`Starting full bundle sync for customer ${customerId}...`);
+
+  // 1. Fetch real customer profile
+  const customer = await moegoClient.getCustomerById(customerId);
+  if (!customer || !customer.id) {
+    throw new Error(`Customer ${customerId} not found in MoeGo.`);
+  }
+
+  // 2. Fetch all appointments for customer (multi-page)
+  const appointments = await moegoClient.getAllAppointmentsForCustomer(customerId);
+
+  // 3. Fetch pets for customer
+  const petData = await moegoClient.listPets(1, 100);
+  const customerPets = (petData.pets || []).filter(p => p.customerId === customerId);
+
+  // 4. STEP 1: Sync Contact (Rule 5: Order matters)
+  const contactProps = mapCustomerToContact(customer, customerPets, appointments);
+  const contactRes = await hubspotClient.upsertContact(customerId, contactProps);
+  const hubspotContactId = contactRes.id;
+  logger.info(`Contact ${customer.firstName} ${customer.lastName} (${customerId}) -> HubSpot Contact ID: ${hubspotContactId} [${contactRes.action}]`);
+
+  // 5. STEP 2: Sync Pets (Company Object) and Associate to Contact
+  const petHubspotMap = {};
+  const petSyncResults = [];
+
+  for (const pet of customerPets) {
+    const petProps = mapPetToCompany(pet);
+    const petRes = await hubspotClient.upsertPet(pet.id, petProps);
+    const hubspotCompanyId = petRes.id;
+    petHubspotMap[pet.id] = hubspotCompanyId;
+
+    // Associate Pet -> Contact
+    await hubspotClient.associatePetToContact(hubspotCompanyId, hubspotContactId);
+    petSyncResults.push({ petId: pet.id, name: pet.name, hubspotId: hubspotCompanyId, action: petRes.action });
+    logger.info(`Pet ${pet.name} (${pet.id}) -> HubSpot Company/Pet ID: ${hubspotCompanyId} [${petRes.action}]`);
+  }
+
+  // 6. STEP 3: Sync Appointments (Deals) and Dual Associate (Deal -> Contact AND Deal -> Pet)
+  const dealSyncResults = [];
+  const staffMap = await moegoClient.getStaffMap();
+
+  for (const appt of appointments) {
+    const psd = appt.petServiceDetails || [];
+    const staffIds = psd[0]?.serviceDetails?.[0]?.staffIds || [];
+    const groomerName = staffIds.length > 0 ? (staffMap[staffIds[0]] || 'Staff Posh Paws') : '';
+    const petMoegoId = psd[0]?.pet?.id;
+
+    const dealProps = mapAppointmentToDeal(appt, groomerName);
+    const dealRes = await hubspotClient.upsertDeal(appt.id, dealProps);
+    const hubspotDealId = dealRes.id;
+
+    // Dual Associations
+    await hubspotClient.associateDealToContact(hubspotDealId, hubspotContactId);
+    if (petMoegoId && petHubspotMap[petMoegoId]) {
+      await hubspotClient.associateDealToPet(hubspotDealId, petHubspotMap[petMoegoId]);
+    }
+
+    dealSyncResults.push({ appointmentId: appt.id, hubspotId: hubspotDealId, action: dealRes.action });
+    logger.info(`Appointment ${dealProps.dealname} (${appt.id}) -> HubSpot Deal ID: ${hubspotDealId} [${dealRes.action}]`);
+  }
+
+  return {
+    contact: { id: hubspotContactId, action: contactRes.action, customerId },
+    pets: petSyncResults,
+    deals: dealSyncResults
+  };
+}
+
+/**
+ * Runs a complete historical backfill across all customers, pets, and appointments
+ */
+async function runFullBackfill(progressCallback = null) {
+  logger.info('====================================================');
+  logger.info('   STARTING FULL HISTORICAL BACKFILL (MoeGo -> HubSpot)');
+  logger.info('====================================================');
+
+  const startTime = new Date();
+  let totalCustomersProcessed = 0;
+  let totalCreated = 0;
+  let totalUpdated = 0;
+  let totalErrors = 0;
+
+  try {
+    // Prime staff cache
+    await moegoClient.getStaffMap(true);
+
+    // 1. Fetch all appointments across all pages and group by customerId
+    logger.info('Step 1/3: Fetching all appointments across all pages...');
+    const allAppointmentsByCustomer = {};
+    let apptPage = 1;
+    let totalAppts = 0;
+
+    while (true) {
+      const apptData = await moegoClient.listAppointments(apptPage, 100);
+      const apts = apptData.appointments || [];
+      if (!apts.length) break;
+
+      totalAppts += apts.length;
+      for (const a of apts) {
+        if (a.customerId) {
+          if (!allAppointmentsByCustomer[a.customerId]) {
+            allAppointmentsByCustomer[a.customerId] = [];
+          }
+          allAppointmentsByCustomer[a.customerId].push(a);
+        }
+      }
+
+      if (!apptData.nextPageToken || apptData.nextPageToken === '') break;
+      apptPage++;
+      if (apptPage > 100) break;
+    }
+    logger.info(`Loaded ${totalAppts} appointments across ${apptPage} pages for ${Object.keys(allAppointmentsByCustomer).length} customers.`);
+
+    // 2. Fetch all pets across all pages and group by customerId
+    logger.info('Step 2/3: Fetching all pets across all pages...');
+    const allPetsByCustomer = {};
+    let petPage = 1;
+    let totalPets = 0;
+
+    while (true) {
+      const petData = await moegoClient.listPets(petPage, 100);
+      const pets = petData.pets || [];
+      if (!pets.length) break;
+
+      totalPets += pets.length;
+      for (const p of pets) {
+        if (p.customerId) {
+          if (!allPetsByCustomer[p.customerId]) {
+            allPetsByCustomer[p.customerId] = [];
+          }
+          allPetsByCustomer[p.customerId].push(p);
+        }
+      }
+
+      if (!petData.nextPageToken || petData.nextPageToken === '') break;
+      petPage++;
+      if (petPage > 100) break;
+    }
+    logger.info(`Loaded ${totalPets} pets across ${petPage} pages.`);
+
+    // 3. Process all customers and sync full trees
+    logger.info('Step 3/3: Syncing customers, pets, and appointments...');
+    let custPage = 1;
+
+    while (true) {
+      const custData = await moegoClient.listCustomers(custPage, 100);
+      const customers = custData.customers || [];
+      if (!customers.length) break;
+
+      for (const customer of customers) {
+        const custId = customer.id;
+        try {
+          const custPets = allPetsByCustomer[custId] || [];
+          const custAppts = allAppointmentsByCustomer[custId] || [];
+
+          // 1. Sync Contact
+          const contactProps = mapCustomerToContact(customer, custPets, custAppts);
+          const cRes = await hubspotClient.upsertContact(custId, contactProps);
+          const contactId = cRes.id;
+          if (cRes.action === 'CREATED') totalCreated++;
+          else totalUpdated++;
+
+          // 2. Sync Pets & Associate
+          const petHubspotMap = {};
+          for (const pet of custPets) {
+            const petProps = mapPetToCompany(pet);
+            const pRes = await hubspotClient.upsertPet(pet.id, petProps);
+            petHubspotMap[pet.id] = pRes.id;
+            await hubspotClient.associatePetToContact(pRes.id, contactId);
+          }
+
+          // 3. Sync Appointments & Dual Associate
+          const staffMap = await moegoClient.getStaffMap();
+          for (const a of custAppts) {
+            const psd = a.petServiceDetails || [];
+            const staffIds = psd[0]?.serviceDetails?.[0]?.staffIds || [];
+            const groomerName = staffIds.length > 0 ? (staffMap[staffIds[0]] || 'Staff Posh Paws') : '';
+            const petMoegoId = psd[0]?.pet?.id;
+
+            const dealProps = mapAppointmentToDeal(a, groomerName);
+            const dRes = await hubspotClient.upsertDeal(a.id, dealProps);
+            await hubspotClient.associateDealToContact(dRes.id, contactId);
+            if (petMoegoId && petHubspotMap[petMoegoId]) {
+              await hubspotClient.associateDealToPet(dRes.id, petHubspotMap[petMoegoId]);
+            }
+          }
+
+          totalCustomersProcessed++;
+          if (totalCustomersProcessed % 25 === 0) {
+            logger.info(`Progress: Synced ${totalCustomersProcessed} customer trees...`);
+          }
+        } catch (err) {
+          totalErrors++;
+          logger.error(`Error syncing customer ${custId}: %s`, err.message);
+        }
+      }
+
+      if (!custData.nextPageToken || custData.nextPageToken === '') break;
+      custPage++;
+      if (custPage > 100) break;
+    }
+
+    const nowIso = new Date().toISOString();
+    setSyncCursor('last_backfill_completed_at', nowIso);
+    setSyncCursor('last_reconcile_timestamp', nowIso);
+
+    logSyncRun('FULL_BACKFILL', 'SUCCESS', {
+      processed: totalCustomersProcessed,
+      created: totalCreated,
+      updated: totalUpdated,
+      errors: totalErrors
+    }, `Completed full backfill in ${Math.round((Date.now() - startTime.getTime()) / 1000)}s`);
+
+    logger.info('====================================================');
+    logger.info(`FULL BACKFILL COMPLETE: Processed=${totalCustomersProcessed}, Created=${totalCreated}, Updated=${totalUpdated}, Errors=${totalErrors}`);
+    logger.info('====================================================');
+
+    return {
+      status: 'SUCCESS',
+      processed: totalCustomersProcessed,
+      created: totalCreated,
+      updated: totalUpdated,
+      errors: totalErrors,
+      durationSeconds: Math.round((Date.now() - startTime.getTime()) / 1000)
+    };
+  } catch (err) {
+    logger.error('Full backfill failed: %s', err.stack || err.message);
+    logSyncRun('FULL_BACKFILL', 'FAILED', { processed: totalCustomersProcessed, errors: totalErrors + 1 }, err.message);
+    throw err;
+  }
+}
+
+module.exports = {
+  syncCustomerBundle,
+  runFullBackfill
+};

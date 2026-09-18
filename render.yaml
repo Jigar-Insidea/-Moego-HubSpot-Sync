@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: moego-hubspot-sync
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    disk:
+      name: sync-state-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: SYNC_STATE_DB_PATH
+        value: /var/data/sync_state.json
+      - key: MOEGO_API_KEY_B64
+        sync: false
+      - key: MOEGO_BASE_URL
+        value: https://openapi.moego.pet
+      - key: MOEGO_COMPANY_ID
+        value: copaRXx
+      - key: MOEGO_BUSINESS_IDS
+        value: bizT2HX,bizVaEO
+      - key: HUBSPOT_ACCESS_TOKEN
+        sync: false
+      - key: HUBSPOT_PORTAL_ID
+        value: "245256880"
+      - key: HUBSPOT_PIPELINE_ID
+        value: default
+      - key: CRON_RECONCILE_SCHEDULE
+        value: "*/5 * * * *"
