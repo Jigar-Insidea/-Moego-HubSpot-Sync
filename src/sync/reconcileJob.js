@@ -1,12 +1,11 @@
 const cron = require('node-cron');
 const env = require('../config/env');
-const { runFullBackfill, syncCustomerBundle } = require('./syncEngine');
-const { getSyncCursor, setSyncCursor, logSyncRun } = require('../storage/stateStore');
+const { runDeltaReconcile } = require('./syncEngine');
 const logger = require('../utils/logger');
 
 let isJobRunning = false;
 let jobStartedAt = null;
-const LOCK_TIMEOUT_MS = 25 * 60 * 1000; // 25-minute safety lock timeout
+const LOCK_TIMEOUT_MS = 15 * 60 * 1000; // 15-minute lock timeout
 
 /**
  * Checks and acquires execution lock
@@ -38,7 +37,7 @@ function releaseLock() {
 }
 
 /**
- * Executes a safe, locked reconciliation pass
+ * Executes a safe, locked delta reconciliation pass
  */
 async function executeReconciliation() {
   if (!acquireLock()) {
@@ -47,17 +46,14 @@ async function executeReconciliation() {
 
   const startTime = new Date();
   logger.info('====================================================');
-  logger.info(`   STARTING 5-MINUTE SYNC CYCLE at ${startTime.toISOString()}`);
+  logger.info(`   STARTING 5-MINUTE DELTA SYNC CYCLE at ${startTime.toISOString()}`);
   logger.info('====================================================');
 
   try {
-    const result = await runFullBackfill();
-    const nowIso = new Date().toISOString();
-    setSyncCursor('last_reconcile_timestamp', nowIso);
-    logger.info(`5-Minute Sync Cycle finished successfully in ${result.durationSeconds}s.`);
+    const result = await runDeltaReconcile();
     return result;
   } catch (err) {
-    logger.error('Sync cycle encountered an error: %s', err.message);
+    logger.error('5-minute sync cycle encountered an error: %s', err.message);
     return { status: 'FAILED', error: err.message };
   } finally {
     releaseLock();
@@ -65,7 +61,7 @@ async function executeReconciliation() {
 }
 
 /**
- * Initializes the node-cron scheduled sync job (Default: Every 5 Minutes)
+ * Initializes the node-cron scheduled sync job (Every 5 Minutes)
  */
 function initReconciliationCron() {
   const schedule = env.CRON_RECONCILE_SCHEDULE;

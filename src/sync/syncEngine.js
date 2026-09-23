@@ -47,7 +47,7 @@ async function syncCustomerBundle(customerId) {
     logger.info(`Pet ${pet.name} (${pet.id}) -> HubSpot Company/Pet ID: ${hubspotCompanyId} [${petRes.action}]`);
   }
 
-  // 6. STEP 3: Sync Appointments (Deals) and Dual Associate (Deal -> Contact AND Deal -> Pet)
+  // 6. STEP 3: Sync Appointments (Deals) and Dual Associate
   const dealSyncResults = [];
   const staffMap = await moegoClient.getStaffMap();
 
@@ -79,7 +79,59 @@ async function syncCustomerBundle(customerId) {
 }
 
 /**
- * Runs a complete historical backfill across all customers, pets, and appointments
+ * Lightweight 5-Minute Delta Reconciliation Pass
+ * Scans recent pages for modifications and syncs affected customer trees
+ */
+async function runDeltaReconcile() {
+  logger.info('Running 5-minute lightweight Delta Reconciliation...');
+  const startTime = Date.now();
+  const modifiedCustomerIds = new Set();
+
+  try {
+    // 1. Scan recent appointments (Pages 1 to 3)
+    for (let p = 1; p <= 3; p++) {
+      const aptData = await moegoClient.listAppointments(p, 50);
+      for (const a of aptData.appointments || []) {
+        if (a.customerId) modifiedCustomerIds.add(a.customerId);
+      }
+    }
+
+    // 2. Scan recent customers (Page 1)
+    const custData = await moegoClient.listCustomers(1, 50);
+    for (const c of custData.customers || []) {
+      if (c.id) modifiedCustomerIds.add(c.id);
+    }
+
+    logger.info(`Delta sync identified ${modifiedCustomerIds.size} active/recent customer trees to reconcile.`);
+
+    let syncedCount = 0;
+    for (const custId of modifiedCustomerIds) {
+      try {
+        await syncCustomerBundle(custId);
+        syncedCount++;
+      } catch (err) {
+        logger.error(`Delta sync error on customer ${custId}: %s`, err.message);
+      }
+    }
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    const nowIso = new Date().toISOString();
+    setSyncCursor('last_reconcile_timestamp', nowIso);
+    logger.info(`Delta sync completed: Reconciled ${syncedCount}/${modifiedCustomerIds.size} customer trees in ${elapsed}s.`);
+
+    return {
+      status: 'SUCCESS',
+      reconciled: syncedCount,
+      durationSeconds: elapsed
+    };
+  } catch (err) {
+    logger.error('Delta reconciliation error: %s', err.message);
+    throw err;
+  }
+}
+
+/**
+ * Memory-Optimized Full Historical Backfill
  */
 async function runFullBackfill(progressCallback = null) {
   logger.info('====================================================');
@@ -96,8 +148,8 @@ async function runFullBackfill(progressCallback = null) {
     // Prime staff cache
     await moegoClient.getStaffMap(true);
 
-    // 1. Fetch all appointments across all pages and group by customerId
-    logger.info('Step 1/3: Fetching all appointments across all pages...');
+    // 1. Fetch appointments across all pages and store lean summary objects
+    logger.info('Step 1/3: Fetching all appointments across all pages (lean index)...');
     const allAppointmentsByCustomer = {};
     let apptPage = 1;
     let totalAppts = 0;
@@ -113,18 +165,28 @@ async function runFullBackfill(progressCallback = null) {
           if (!allAppointmentsByCustomer[a.customerId]) {
             allAppointmentsByCustomer[a.customerId] = [];
           }
-          allAppointmentsByCustomer[a.customerId].push(a);
+          // Store only necessary fields to keep memory footprint minimal
+          allAppointmentsByCustomer[a.customerId].push({
+            id: a.id,
+            customerId: a.customerId,
+            businessId: a.businessId,
+            status: a.status,
+            noShow: a.noShow,
+            totalAmount: a.totalAmount,
+            duration: a.duration,
+            petServiceDetails: a.petServiceDetails
+          });
         }
       }
 
       if (!apptData.nextPageToken || apptData.nextPageToken === '') break;
       apptPage++;
-      if (apptPage > 100) break;
+      if (apptPage > 150) break;
     }
     logger.info(`Loaded ${totalAppts} appointments across ${apptPage} pages for ${Object.keys(allAppointmentsByCustomer).length} customers.`);
 
-    // 2. Fetch all pets across all pages and group by customerId
-    logger.info('Step 2/3: Fetching all pets across all pages...');
+    // 2. Fetch pets across all pages (lean index)
+    logger.info('Step 2/3: Fetching all pets across all pages (lean index)...');
     const allPetsByCustomer = {};
     let petPage = 1;
     let totalPets = 0;
@@ -140,17 +202,29 @@ async function runFullBackfill(progressCallback = null) {
           if (!allPetsByCustomer[p.customerId]) {
             allPetsByCustomer[p.customerId] = [];
           }
-          allPetsByCustomer[p.customerId].push(p);
+          allPetsByCustomer[p.customerId].push({
+            id: p.id,
+            name: p.name,
+            type: p.type,
+            breed: p.breed,
+            weight: p.weight,
+            fixed: p.fixed,
+            birthday: p.birthday,
+            coat: p.coat,
+            notes: p.notes,
+            status: p.status,
+            deleted: p.deleted
+          });
         }
       }
 
       if (!petData.nextPageToken || petData.nextPageToken === '') break;
       petPage++;
-      if (petPage > 100) break;
+      if (petPage > 150) break;
     }
     logger.info(`Loaded ${totalPets} pets across ${petPage} pages.`);
 
-    // 3. Process all customers and sync full trees
+    // 3. Process all customers page by page
     logger.info('Step 3/3: Syncing customers, pets, and appointments...');
     let custPage = 1;
 
@@ -198,7 +272,7 @@ async function runFullBackfill(progressCallback = null) {
           }
 
           totalCustomersProcessed++;
-          if (totalCustomersProcessed % 25 === 0) {
+          if (totalCustomersProcessed % 50 === 0) {
             logger.info(`Progress: Synced ${totalCustomersProcessed} customer trees...`);
           }
         } catch (err) {
@@ -209,7 +283,7 @@ async function runFullBackfill(progressCallback = null) {
 
       if (!custData.nextPageToken || custData.nextPageToken === '') break;
       custPage++;
-      if (custPage > 100) break;
+      if (custPage > 150) break;
     }
 
     const nowIso = new Date().toISOString();
@@ -244,5 +318,6 @@ async function runFullBackfill(progressCallback = null) {
 
 module.exports = {
   syncCustomerBundle,
+  runDeltaReconcile,
   runFullBackfill
 };

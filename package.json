@@ -4,10 +4,10 @@
   "description": "Production-grade synchronization middleware connecting MoeGo POS/CRM and HubSpot CRM for Vera's Posh Paws",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node --max-old-space-size=1024 src/index.js",
     "dev": "node --watch src/index.js",
     "test": "node --test tests/**/*.test.js",
-    "sync:full": "node scripts/runFullBackfill.js",
+    "sync:full": "node --max-old-space-size=1024 scripts/runFullBackfill.js",
     "sync:reconcile": "node scripts/runReconciliation.js"
   },
   "engines": {

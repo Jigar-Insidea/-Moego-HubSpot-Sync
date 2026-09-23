@@ -31,6 +31,10 @@ async function requestWithRetry(config, retries = 4) {
         logger.warn(`HubSpot API ${config.method} ${config.url} failed (${status}). Retrying in ${Math.round(delay)}ms...`);
         await sleep(delay);
       } else {
+        if (status === 400) {
+          const detail = err.response?.data?.message || JSON.stringify(err.response?.data || {});
+          logger.error(`HubSpot 400 Validation Error on ${config.method} ${config.url}: ${detail}`);
+        }
         throw err;
       }
     }
@@ -38,9 +42,27 @@ async function requestWithRetry(config, retries = 4) {
 }
 
 /**
+ * Clean & sanitize properties before pushing to HubSpot
+ */
+function sanitizeProperties(props) {
+  const clean = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (v !== undefined && v !== null) {
+      const strVal = String(v).trim();
+      // Only keep non-empty strings (or allow empty closedate)
+      if (strVal !== '' || k === 'closedate') {
+        clean[k] = strVal;
+      }
+    }
+  }
+  return clean;
+}
+
+/**
  * Upsert Contact in HubSpot via unique idProperty (moego_customer_id)
  */
-async function upsertContact(moegoCustomerId, properties) {
+async function upsertContact(moegoCustomerId, rawProperties) {
+  const properties = sanitizeProperties(rawProperties);
   try {
     const existing = await requestWithRetry({
       method: 'GET',
@@ -55,7 +77,6 @@ async function upsertContact(moegoCustomerId, properties) {
     return { id: contactId, action: 'UPDATED' };
   } catch (err) {
     if (err.response && err.response.status === 404) {
-      // Create new contact
       try {
         const created = await requestWithRetry({
           method: 'POST',
@@ -86,7 +107,8 @@ async function upsertContact(moegoCustomerId, properties) {
 /**
  * Upsert Pet (Company Object) in HubSpot via unique idProperty (moego_pet_id)
  */
-async function upsertPet(moegoPetId, properties) {
+async function upsertPet(moegoPetId, rawProperties) {
+  const properties = sanitizeProperties(rawProperties);
   try {
     const existing = await requestWithRetry({
       method: 'GET',
@@ -137,7 +159,8 @@ async function upsertPet(moegoPetId, properties) {
 /**
  * Upsert Appointment (Deal) in HubSpot via unique idProperty (moego_appointment_id)
  */
-async function upsertDeal(moegoAppointmentId, properties) {
+async function upsertDeal(moegoAppointmentId, rawProperties) {
+  const properties = sanitizeProperties(rawProperties);
   try {
     const existing = await requestWithRetry({
       method: 'GET',
@@ -184,17 +207,22 @@ async function upsertDeal(moegoAppointmentId, properties) {
  */
 async function associatePetToContact(companyId, contactId) {
   if (!companyId || !contactId) return null;
-  return requestWithRetry({
-    method: 'POST',
-    url: '/crm/v3/associations/companies/contacts/batch/create',
-    data: {
-      inputs: [{
-        from: { id: String(companyId) },
-        to: { id: String(contactId) },
-        type: 'company_to_contact'
-      }]
-    }
-  });
+  try {
+    return await requestWithRetry({
+      method: 'POST',
+      url: '/crm/v3/associations/companies/contacts/batch/create',
+      data: {
+        inputs: [{
+          from: { id: String(companyId) },
+          to: { id: String(contactId) },
+          type: 'company_to_contact'
+        }]
+      }
+    });
+  } catch (err) {
+    logger.warn(`Association Pet ${companyId} -> Contact ${contactId} failed: ${err.message}`);
+    return null;
+  }
 }
 
 /**
@@ -202,17 +230,22 @@ async function associatePetToContact(companyId, contactId) {
  */
 async function associateDealToContact(dealId, contactId) {
   if (!dealId || !contactId) return null;
-  return requestWithRetry({
-    method: 'POST',
-    url: '/crm/v3/associations/deals/contacts/batch/create',
-    data: {
-      inputs: [{
-        from: { id: String(dealId) },
-        to: { id: String(contactId) },
-        type: 'deal_to_contact'
-      }]
-    }
-  });
+  try {
+    return await requestWithRetry({
+      method: 'POST',
+      url: '/crm/v3/associations/deals/contacts/batch/create',
+      data: {
+        inputs: [{
+          from: { id: String(dealId) },
+          to: { id: String(contactId) },
+          type: 'deal_to_contact'
+        }]
+      }
+    });
+  } catch (err) {
+    logger.warn(`Association Deal ${dealId} -> Contact ${contactId} failed: ${err.message}`);
+    return null;
+  }
 }
 
 /**
@@ -220,17 +253,22 @@ async function associateDealToContact(dealId, contactId) {
  */
 async function associateDealToPet(dealId, companyId) {
   if (!dealId || !companyId) return null;
-  return requestWithRetry({
-    method: 'POST',
-    url: '/crm/v3/associations/deals/companies/batch/create',
-    data: {
-      inputs: [{
-        from: { id: String(dealId) },
-        to: { id: String(companyId) },
-        type: 'deal_to_company'
-      }]
-    }
-  });
+  try {
+    return await requestWithRetry({
+      method: 'POST',
+      url: '/crm/v3/associations/deals/companies/batch/create',
+      data: {
+        inputs: [{
+          from: { id: String(dealId) },
+          to: { id: String(companyId) },
+          type: 'deal_to_company'
+        }]
+      }
+    });
+  } catch (err) {
+    logger.warn(`Association Deal ${dealId} -> Pet ${companyId} failed: ${err.message}`);
+    return null;
+  }
 }
 
 module.exports = {
@@ -239,5 +277,6 @@ module.exports = {
   upsertDeal,
   associatePetToContact,
   associateDealToContact,
-  associateDealToPet
+  associateDealToPet,
+  sanitizeProperties
 };
