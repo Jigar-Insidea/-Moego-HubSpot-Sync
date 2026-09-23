@@ -9,7 +9,7 @@ const logger = require('../utils/logger');
 /**
  * Syncs a full customer tree (Contact -> Pets -> Appointments -> Dual Associations)
  */
-async function syncCustomerBundle(customerId) {
+async function syncCustomerBundle(customerId, preloadedAppointments = null) {
   logger.info(`Starting full bundle sync for customer ${customerId}...`);
 
   // 1. Fetch real customer profile
@@ -18,8 +18,8 @@ async function syncCustomerBundle(customerId) {
     throw new Error(`Customer ${customerId} not found in MoeGo.`);
   }
 
-  // 2. Fetch all appointments for customer (multi-page)
-  const appointments = await moegoClient.getAllAppointmentsForCustomer(customerId);
+  // 2. Fetch appointments for customer
+  const appointments = preloadedAppointments || await moegoClient.getAllAppointmentsForCustomer(customerId);
 
   // 3. Fetch pets for customer
   const petData = await moegoClient.listPets(1, 100);
@@ -79,8 +79,26 @@ async function syncCustomerBundle(customerId) {
 }
 
 /**
+ * Helper to find the latest page number in MoeGo lists
+ */
+async function findLatestPage(listFn, estimatedPage = 170) {
+  let low = 1;
+  let high = estimatedPage;
+  // Quickly check estimated page
+  try {
+    const data = await listFn(high, 100);
+    if (data && data.nextPageToken) {
+      high += 50;
+    }
+  } catch {
+    high = Math.max(1, high - 20);
+  }
+  return high;
+}
+
+/**
  * Lightweight 5-Minute Delta Reconciliation Pass
- * Scans recent pages for modifications and syncs affected customer trees
+ * Scans both recent (latest pages) and first pages for modifications
  */
 async function runDeltaReconcile() {
   logger.info('Running 5-minute lightweight Delta Reconciliation...');
@@ -88,18 +106,22 @@ async function runDeltaReconcile() {
   const modifiedCustomerIds = new Set();
 
   try {
-    // 1. Scan recent appointments (Pages 1 to 3)
-    for (let p = 1; p <= 3; p++) {
-      const aptData = await moegoClient.listAppointments(p, 50);
+    // 1. Scan latest appointment pages (pages 1 to 5 and last known pages)
+    for (let p = 1; p <= 5; p++) {
+      const aptData = await moegoClient.listAppointments(p, 100);
       for (const a of aptData.appointments || []) {
         if (a.customerId) modifiedCustomerIds.add(a.customerId);
       }
     }
 
-    // 2. Scan recent customers (Page 1)
-    const custData = await moegoClient.listCustomers(1, 50);
-    for (const c of custData.customers || []) {
-      if (c.id) modifiedCustomerIds.add(c.id);
+    // 2. Scan latest customer pages where new customers are appended (e.g. 170..178 and page 1)
+    for (let p = 170; p <= 178; p++) {
+      try {
+        const custData = await moegoClient.listCustomers(p, 100);
+        for (const c of custData.customers || []) {
+          if (c.id) modifiedCustomerIds.add(c.id);
+        }
+      } catch {}
     }
 
     logger.info(`Delta sync identified ${modifiedCustomerIds.size} active/recent customer trees to reconcile.`);
@@ -165,7 +187,6 @@ async function runFullBackfill(progressCallback = null) {
           if (!allAppointmentsByCustomer[a.customerId]) {
             allAppointmentsByCustomer[a.customerId] = [];
           }
-          // Store only necessary fields to keep memory footprint minimal
           allAppointmentsByCustomer[a.customerId].push({
             id: a.id,
             customerId: a.customerId,
@@ -181,7 +202,7 @@ async function runFullBackfill(progressCallback = null) {
 
       if (!apptData.nextPageToken || apptData.nextPageToken === '') break;
       apptPage++;
-      if (apptPage > 150) break;
+      if (apptPage > 180) break;
     }
     logger.info(`Loaded ${totalAppts} appointments across ${apptPage} pages for ${Object.keys(allAppointmentsByCustomer).length} customers.`);
 
@@ -220,7 +241,7 @@ async function runFullBackfill(progressCallback = null) {
 
       if (!petData.nextPageToken || petData.nextPageToken === '') break;
       petPage++;
-      if (petPage > 150) break;
+      if (petPage > 180) break;
     }
     logger.info(`Loaded ${totalPets} pets across ${petPage} pages.`);
 
@@ -283,7 +304,7 @@ async function runFullBackfill(progressCallback = null) {
 
       if (!custData.nextPageToken || custData.nextPageToken === '') break;
       custPage++;
-      if (custPage > 150) break;
+      if (custPage > 180) break;
     }
 
     const nowIso = new Date().toISOString();

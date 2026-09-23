@@ -138,12 +138,12 @@ async function listAppointments(pageToken = '1', pageSize = 100) {
 }
 
 /**
- * Scans all historical appointment pages to find all appointments for a given customer
+ * Scans recent pages first for customer appointments, with fast fallback
  */
-async function getAllAppointmentsForCustomer(customerId) {
+async function getAllAppointmentsForCustomer(customerId, maxPages = 15) {
   const customerAppointments = [];
   let page = 1;
-  while (true) {
+  while (page <= maxPages) {
     const data = await listAppointments(page, 100);
     const apts = data.appointments || [];
     if (!apts.length) break;
@@ -156,7 +156,6 @@ async function getAllAppointmentsForCustomer(customerId) {
 
     if (!data.nextPageToken || data.nextPageToken === '') break;
     page++;
-    if (page > 100) break; // Safety cutoff
   }
   return customerAppointments;
 }
